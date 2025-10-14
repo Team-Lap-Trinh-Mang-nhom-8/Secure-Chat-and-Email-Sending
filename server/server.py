@@ -1,70 +1,169 @@
 import asyncio
 import ssl
+import json
+import logging
+from datetime import datetime
 
-# ======== CẤU HÌNH SERVER ========
-HOST = '0.0.0.0'
+# ================== CẤU HÌNH ==================
+HOST = "0.0.0.0"
 PORT = 5555
-CERT_FILE = 'server.crt'
-KEY_FILE = 'server.key'
+CERT_FILE = "server.crt"
+KEY_FILE = "server.key"
 
-# Danh sách client kết nối: {writer, username}
-clients = []
+# Thiết lập logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("server.log"),
+        logging.StreamHandler()
+    ]
+)
 
-# ======== XỬ LÝ CLIENT ========
-async def handle_client(reader, writer):
-    addr = writer.get_extra_info('peername')
+# ================== QUẢN LÝ CLIENT ==================
+class ClientManager:
+    def __init__(self):
+        self.clients = {}  # username -> writer
+
+    def add_client(self, username, writer):
+        self.clients[username] = writer
+        logging.info(f"✅ {username} đã kết nối. Tổng client: {len(self.clients)}")
+
+    def remove_client(self, username):
+        self.clients.pop(username, None)
+        logging.info(f"❌ {username} ngắt kết nối. Còn lại: {len(self.clients)}")
+
+    def get_writer(self, username):
+        return self.clients.get(username)
+
+    def all_clients(self):
+        return self.clients.items()
+
+clients = ClientManager()
+
+# ================== HÀM HỖ TRỢ ==================
+async def send_json(writer, data):
     try:
-        # Yêu cầu username
-        writer.write("USERNAME?".encode())
+        message = json.dumps(data).encode()
+        writer.write(message + b"\n")
         await writer.drain()
-        username = (await reader.read(1024)).decode().strip()
-        clients.append({"writer": writer, "username": username})
-        print(f"[NEW CONNECTION] {username} ({addr}) connected. Active clients: {len(clients)}")
+    except Exception as e:
+        logging.error(f"Lỗi gửi dữ liệu: {e}")
 
-        # Thông báo client join
-        await broadcast(f"[{username}] joined the chat!", writer)
+async def read_json(reader):
+    try:
+        line = await reader.readline()
+        if not line:
+            return None
+        return json.loads(line.decode().strip())
+    except Exception as e:
+        logging.error(f"Lỗi đọc dữ liệu: {e}")
+        return None
 
+async def broadcast(data, exclude_username=None):
+    """Gửi cho tất cả client trừ người gửi"""
+    for username, writer in clients.all_clients():
+        if username != exclude_username:
+            await send_json(writer, data)
+
+async def send_private(sender, target, message):
+    """Nhắn riêng giữa hai người"""
+    target_writer = clients.get_writer(target)
+    if target_writer:
+        await send_json(target_writer, {
+            "type": "pm",
+            "sender": sender,
+            "message": message,
+            "timestamp": datetime.now().isoformat()
+        })
+    else:
+        sender_writer = clients.get_writer(sender)
+        await send_json(sender_writer, {
+            "type": "error",
+            "message": f"Không tìm thấy người dùng {target}"
+        })
+
+# ================== XỬ LÝ LỆNH ==================
+async def handle_command(username, data):
+    cmd = data.get("type")
+
+    if cmd == "chat":
+        msg = {
+            "type": "chat",
+            "sender": username,
+            "message": data.get("message", ""),
+            "timestamp": datetime.now().isoformat()
+        }
+        await broadcast(msg, exclude_username=username)
+
+    elif cmd == "pm":
+        await send_private(username, data.get("target"), data.get("message"))
+
+    elif cmd == "mail":
+        # Giả lập xử lý gửi mail (sẽ để nhóm khác làm thật)
+        await send_json(clients.get_writer(username), {
+            "type": "system",
+            "message": f"Mail đã được gửi đến {data.get('to')} (giả lập)"
+        })
+
+    else:
+        logging.warning(f"Lệnh không hợp lệ từ {username}: {cmd}")
+        await send_json(clients.get_writer(username), {
+            "type": "error",
+            "message": f"Lệnh không hợp lệ: {cmd}"
+        })
+
+# ================== XỬ LÝ CLIENT ==================
+async def handle_client(reader, writer):
+    addr = writer.get_extra_info("peername")
+    try:
+        # Gửi yêu cầu username
+        await send_json(writer, {"type": "system", "message": "USERNAME?"})
+        username_data = await read_json(reader)
+        if not username_data:
+            writer.close()
+            return
+
+        username = username_data.get("username")
+        clients.add_client(username, writer)
+
+        # Thông báo người khác biết
+        await broadcast({
+            "type": "system",
+            "message": f"{username} đã tham gia vào phòng chat."
+        }, exclude_username=username)
+
+        # Vòng lặp nhận tin
         while True:
-            data = await reader.read(1024)
+            data = await read_json(reader)
             if not data:
                 break
-            message = data.decode().strip()
-            print(f"[{username}] {message}")
-            await broadcast(f"[{username}] {message}", writer)
+            await handle_command(username, data)
 
     except Exception as e:
-        print(f"[ERROR] {addr}: {e}")
+        logging.error(f"Lỗi xử lý client {addr}: {e}")
 
     finally:
-        # Remove client khi ngắt kết nối
-        clients[:] = [c for c in clients if c["writer"] != writer]
+        clients.remove_client(username)
         writer.close()
         await writer.wait_closed()
-        print(f"[DISCONNECT] {username} ({addr}) disconnected. Active clients: {len(clients)}")
-        await broadcast(f"[{username}] left the chat.", None)
+        await broadcast({
+            "type": "system",
+            "message": f"{username} đã rời phòng."
+        })
 
-# ======== BROADCAST TIN NHẮN ========
-async def broadcast(message, sender_writer):
-    for c in clients:
-        if c["writer"] != sender_writer:
-            try:
-                c["writer"].write(message.encode())
-                await c["writer"].drain()
-            except:
-                pass
-
-# ======== KHỞI TẠO SERVER ========
+# ================== KHỞI TẠO SERVER ==================
 async def main():
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
 
     server = await asyncio.start_server(handle_client, HOST, PORT, ssl=context)
     addr = server.sockets[0].getsockname()
-    print(f"[LISTENING] Server on {addr}")
+    logging.info(f"🚀 Server lắng nghe tại {addr}")
 
     async with server:
         await server.serve_forever()
 
 if __name__ == "__main__":
-    print("[STARTING] Asyncio SSL Chat Server is starting...")
+    logging.info("Chat Server đang khởi động...")
     asyncio.run(main())
